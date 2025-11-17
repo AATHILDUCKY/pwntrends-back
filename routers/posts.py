@@ -76,7 +76,8 @@ def to_post_out(
     )
 
 
-@router.post("/", response_model=PostOut)
+# 🎯 IMPORTANT CHANGE: remove trailing slash
+@router.post("", response_model=PostOut)
 def create_post_endpoint(
     payload: PostCreate,
     db: Session = Depends(get_db),
@@ -86,7 +87,8 @@ def create_post_endpoint(
     return to_post_out(post, db, current_user)
 
 
-@router.get("/", response_model=List[PostOut])
+# 🎯 IMPORTANT CHANGE: remove trailing slash
+@router.get("", response_model=List[PostOut])
 def list_posts_endpoint(
     post_type: Optional[str] = Query(default=None),
     tag: Optional[str] = Query(default=None),
@@ -107,7 +109,6 @@ def list_posts_endpoint(
     return [to_post_out(p, db, current_user) for p in posts]
 
 
-
 @router.get("/{post_id}", response_model=PostOut)
 def get_post(
     post_id: int,
@@ -123,7 +124,6 @@ def get_post(
     db.refresh(post)
 
     return to_post_out(post, db, current_user)
-
 
 
 @router.put("/{post_id}", response_model=PostOut)

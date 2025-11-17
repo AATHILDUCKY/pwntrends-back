@@ -17,7 +17,10 @@ app = FastAPI(title=settings.PROJECT_NAME)
 
 origins = [o.strip() for o in settings.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
 if not origins:
-    origins = ["*"]
+    origins = [
+    "https://pwntrends.com",
+    "https://www.pwntrends.com",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
