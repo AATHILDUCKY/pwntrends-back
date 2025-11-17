@@ -1,254 +1,202 @@
-from typing import List, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from typing import Optional
+import os
+from uuid import uuid4
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 from auth import get_current_user, get_current_user_optional
 from database import get_db
-from models import Post, Comment, User, Vote, Tag, PostTag
-from schemas import (
-    PostCreate,
-    PostUpdate,
-    PostOut,
-    CommentCreate,
-    CommentOut,
-    VoteIn,
-    UserPublic,
-    TagOut,
-    Message,
-)
-from crud import (
-    list_posts as crud_list_posts,
-    create_post as crud_create_post,
-    update_post as crud_update_post,
-    create_comment as crud_create_comment,
-    cast_vote_on_post,
-)
-
-router = APIRouter(prefix="/posts", tags=["Posts"])
+from models import User, Post, Follow, Bookmark
+from schemas import UserOut, UserPublic, UserProfileUpdate, UserProfileDetail, PostSummary
+from config import settings
 
 
-def to_tag_out(tag: Tag) -> TagOut:
-    return TagOut.from_orm(tag)
+router = APIRouter(prefix="/users", tags=["Users"])
 
 
-def to_post_out(
-    post: Post,
-    db: Session,
-    current_user: Optional[User] = None,
-) -> PostOut:
-    author_public = UserPublic.from_orm(post.author)
+@router.get("/me", response_model=UserOut)
+def get_me(current_user: User = Depends(get_current_user)):
+    """
+    Return the currently authenticated user (private view).
+    Used by the frontend to show logged-in user info.
+    """
+    return current_user
 
-    # Post.tags is a list of PostTag → need underlying Tag
-    tag_models: List[Tag] = [pt.tag for pt in post.tags]
-    tags_out: List[TagOut] = [to_tag_out(t) for t in tag_models]
+@router.put("/me", response_model=UserOut)
+def update_me(
+    payload: UserProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update the current user's own profile (bio, links, etc.).
+    """
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(current_user, field, value)
 
-    # Total score (sum of +1 / -1 for this post)
-    score = (
-        db.query(func.coalesce(func.sum(Vote.value), 0))
-        .filter(Vote.post_id == post.id, Vote.comment_id.is_(None))
-        .scalar()
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.get("/{username}", response_model=UserPublic)
+def get_user_public(
+    username: str,
+    db: Session = Depends(get_db),
+):
+    """
+    PUBLIC profile lookup by username only.
+
+    Frontend calls:
+      GET /users/{username}
+    Example:
+      /users/aathilducky
+    """
+    user: Optional[User] = (
+        db.query(User)
+        .filter(User.username == username)
+        .first()
     )
 
-    # Current user's vote for this post (if any)
-    my_vote_val: Optional[int] = None
-    if current_user:
-        my_vote = (
-            db.query(Vote)
-            .filter(
-                Vote.post_id == post.id,
-                Vote.comment_id.is_(None),
-                Vote.user_id == current_user.id,
-            )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return user
+
+
+
+@router.put("/me", response_model=UserOut)
+def update_me(
+    payload: UserProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update the current user's own profile (bio, links, etc.).
+    """
+
+    data = payload.model_dump(exclude_unset=True)
+
+    # Handle username separately for uniqueness
+    new_username = data.get("username")
+    if new_username and new_username != current_user.username:
+        existing = (
+            db.query(User)
+            .filter(User.username == new_username)
             .first()
         )
-        if my_vote:
-            my_vote_val = my_vote.value
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Username already taken",
+            )
+        current_user.username = new_username
 
-    return PostOut(
-        id=post.id,
-        title=post.title,
-        body=post.body,
-        post_type=post.post_type,
-        is_ctf=post.is_ctf,
-        difficulty=post.difficulty,
-        thumbnail_url=post.thumbnail_url,
-        group_id=post.group_id,
-        author=author_public,
-        tags=tags_out,
-        view_count=post.view_count,
-        repo_url=post.repo_url,
-        tech_stack=post.tech_stack,
-        project_category=post.project_category,
-        license=post.license,
-        looking_for_contributors=post.looking_for_contributors,
-        created_at=post.created_at,
-        updated_at=post.updated_at,
-        score=score,
-        my_vote=my_vote_val,
-    )
+    # Update the rest of the fields
+    updatable_fields = {
+        "full_name",
+        "bio",
+        "location",
+        "status_text",
+        "security_interests",
+        "ctf_team",
+        "ctftime_url",
+        "github_url",
+        "linkedin_url",
+        "twitter_url",
+        "website_url",
+        "avatar_url",  # optional – or remove if only avatar upload endpoint should control this
+    }
 
+    for field, value in data.items():
+        if field in updatable_fields and value is not None:
+            setattr(current_user, field, value)
 
-# ----------------- Create / list posts -----------------
-
-# IMPORTANT: no trailing slash → path is exactly /posts
-@router.post("", response_model=PostOut)
-def create_post_endpoint(
-    payload: PostCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    post = crud_create_post(db, current_user.id, payload)
-    return to_post_out(post, db, current_user)
-
-
-# IMPORTANT: no trailing slash → path is exactly /posts
-@router.get("", response_model=List[PostOut])
-def list_posts_endpoint(
-    post_type: Optional[str] = Query(default=None),
-    tag: Optional[str] = Query(default=None),
-    q: Optional[str] = Query(default=None),
-    skip: int = 0,
-    limit: int = 20,
-    db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
-):
-    posts = crud_list_posts(
-        db,
-        post_type=post_type,
-        tag_slug=tag,
-        search=q,
-        skip=skip,
-        limit=limit,
-    )
-    return [to_post_out(p, db, current_user) for p in posts]
-
-
-# ----------------- Single post -----------------
-
-@router.get("/{post_id}", response_model=PostOut)
-def get_post(
-    post_id: int,
-    db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
-):
-    post = (
-        db.query(Post)
-        .filter(Post.id == post_id, Post.is_deleted == False)
-        .first()
-    )
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    # increment view count
-    post.view_count += 1
     db.commit()
-    db.refresh(post)
+    db.refresh(current_user)
+    return current_user
 
-    return to_post_out(post, db, current_user)
 
-
-@router.put("/{post_id}", response_model=PostOut)
-def update_post_endpoint(
-    post_id: int,
-    payload: PostUpdate,
+@router.post("/me/avatar", response_model=UserOut)
+async def upload_avatar(
+    file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    post = db.query(Post).filter(Post.id == post_id).first()
-    if not post or post.is_deleted:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    if post.author_id != current_user.id:
+    """
+    Upload / update the current user's avatar.
+    Saves file to MEDIA_ROOT/avatars and updates avatar_url on user.
+    """
+    # Basic content-type / extension checks
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    _, ext = os.path.splitext(file.filename.lower())
+    if ext not in allowed_extensions:
         raise HTTPException(
-            status_code=403, detail="Not allowed to edit this post"
+            status_code=400,
+            detail="Unsupported file type. Use JPG, PNG, or WEBP.",
         )
 
-    post = crud_update_post(db, post, payload)
-    return to_post_out(post, db, current_user)
+    contents = await file.read()
+    max_size = 2 * 1024 * 1024  # 2 MB
+    if len(contents) > max_size:
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Max size is 2MB.",
+        )
 
+    # Generate path
+    avatar_dir = os.path.join(settings.MEDIA_ROOT, "avatars")
+    os.makedirs(avatar_dir, exist_ok=True)
 
-# ----------------- Comments -----------------
+    filename = f"user_{current_user.id}_{uuid4().hex}{ext}"
+    file_path = os.path.join(avatar_dir, filename)
 
-@router.post("/{post_id}/comments", response_model=CommentOut)
-def create_comment_endpoint(
-    post_id: int,
-    payload: CommentCreate,
+    # Save file
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    # URL that frontend can use (e.g., http://api-host/media/avatars/xxx.png)
+    current_user.avatar_url = f"{settings.MEDIA_URL}/avatars/{filename}"
+
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+@router.get("/{username}/profile", response_model=UserProfileDetail)
+def get_user_profile(
+    username: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    post = (
-        db.query(Post)
-        .filter(Post.id == post_id, Post.is_deleted == False)
+    """
+    Full public profile: user + related content (recent posts, counts, etc.)
+    """
+    user: Optional[User] = (
+        db.query(User)
+        .filter(User.username == username)
         .first()
     )
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
 
-    comment = crud_create_comment(
-        db,
-        post_id=post_id,
-        author_id=current_user.id,
-        body=payload.body,
-        parent_id=payload.parent_id,
-    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    author_public = UserPublic.from_orm(comment.author)
-    return CommentOut(
-        id=comment.id,
-        body=comment.body,
-        author=author_public,
-        parent_id=comment.parent_id,
-        created_at=comment.created_at,
-        updated_at=comment.updated_at,
-    )
-
-
-@router.get("/{post_id}/comments", response_model=List[CommentOut])
-def list_comments_endpoint(
-    post_id: int,
-    db: Session = Depends(get_db),
-):
-    comments = (
-        db.query(Comment)
-        .filter(Comment.post_id == post_id, Comment.is_deleted == False)
-        .order_by(Comment.created_at.asc())
+    # Recent posts
+    posts = (
+        db.query(Post)
+        .filter(Post.author_id == user.id, Post.is_deleted == False)
+        .order_by(Post.created_at.desc())
+        .limit(10)
         .all()
     )
 
-    out: List[CommentOut] = []
-    for c in comments:
-        author_public = UserPublic.from_orm(c.author)
-        out.append(
-            CommentOut(
-                id=c.id,
-                body=c.body,
-                author=author_public,
-                parent_id=c.parent_id,
-                created_at=c.created_at,
-                updated_at=c.updated_at,
-            )
-        )
-    return out
+    followers_count = db.query(Follow).filter(Follow.following_id == user.id).count()
+    following_count = db.query(Follow).filter(Follow.follower_id == user.id).count()
+    bookmarks_count = db.query(Bookmark).filter(Bookmark.user_id == user.id).count()
 
-
-# ----------------- Voting -----------------
-
-@router.post("/{post_id}/vote", response_model=Message)
-def vote_post_endpoint(
-    post_id: int,
-    payload: VoteIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    post = (
-        db.query(Post)
-        .filter(Post.id == post_id, Post.is_deleted == False)
-        .first()
+    return UserProfileDetail(
+        user=UserPublic.from_orm(user),
+        recent_posts=[PostSummary.from_orm(p) for p in posts],
+        followers_count=followers_count,
+        following_count=following_count,
+        bookmarks_count=bookmarks_count,
     )
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    cast_vote_on_post(db, current_user.id, post_id, int(payload.value))
-    return {"detail": "Vote recorded"}
