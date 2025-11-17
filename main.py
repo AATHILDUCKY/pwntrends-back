@@ -15,11 +15,14 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.PROJECT_NAME)
 
-origins = [o.strip() for o in settings.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
-if not origins:
+# ----------------- CORS -----------------
+if settings.BACKEND_CORS_ORIGINS == "*" or not settings.BACKEND_CORS_ORIGINS:
+    origins = ["*"]
+else:
     origins = [
-    "https://pwntrends.com",
-    "https://www.pwntrends.com",
+        o.strip()
+        for o in settings.BACKEND_CORS_ORIGINS.split(",")
+        if o.strip()
     ]
 
 app.add_middleware(
@@ -30,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# NEW – mount media directory
+# ----------------- Static / media -----------------
 os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
 
 app.mount(
@@ -39,12 +42,12 @@ app.mount(
     name="media",
 )
 
-
+# ----------------- Healthcheck -----------------
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-
+# ----------------- Routers -----------------
 app.include_router(auth_router)
 app.include_router(user_router)
 app.include_router(posts_router)
